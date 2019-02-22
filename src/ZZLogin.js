@@ -5,7 +5,7 @@
  */
 import cookie from './cookie';
 import {wxPromise, wxResolve} from 'fancy-mini/lib/wxPromise';
-import {mergingStep} from 'fancy-mini/lib/decorators';
+import {mergingStep, errSafe} from 'fancy-mini/lib/decorators';
 
 /**
  * 登录模块命名空间
@@ -24,6 +24,7 @@ class ZZLogin {
     t: '', //同source
 
     /**
+     * 已弃用（直接授权改为按钮授权后，拒绝授权导致短期内无法展示弹窗问题不复存在，此字段不再需要）
      * 提示文案，用户曾经拒绝授权导致登录失败时会弹窗提醒并打开授权面板，使其可以重新授权
      * 此处为弹窗提醒的文案内容
      */
@@ -109,11 +110,14 @@ class ZZLogin {
      */
     userAuthHandler: null,
     /**
+     * 已弃用（直接授权改为按钮授权后，拒绝授权导致短期内无法展示弹窗问题不复存在，此函数不再需要）
      * 自定义用户拒绝授权处理逻辑
      * @param {string} denyTip 默认提示文案
      * @return {Promise<Object>} 格式同wx.openSetting，或返回null使用默认处理逻辑
      */
-    userDenyHandler: null,
+    userDenyHandler({denyTip}){
+      return { errMsg: 'fail'};
+    },
     /**
      * 钩子函数，获取用户授权信息失败时触发
      * @param {string} type  失败类型： deny-用户拒绝授权 | unknown-其它原因
@@ -158,7 +162,6 @@ class ZZLogin {
      * 微信登录：调用微信相关API，获取用户标识（openid，某些情况下也能获得unionid）
      * @return {Promise<Object>} 微信用户标识
      */
-    @mergingStep //步骤并合修饰器，避免公共步骤并发重复进行
     async wxLogin(){
       return await wxResolve.login();
     },
@@ -166,31 +169,34 @@ class ZZLogin {
      * 静默授权：对于老用户，根据微信用户标识从数据库中获得用户信息
      * @return {Promise<Object>} 微信用户信息、转转账户信息
      */
-    @mergingStep
     async silentLogin({wxLoginRes}){
       let mpLoginRes = await ZZLogin.request({
-        url: 'https://xxx/mpSilenceLogin', //静默登录接口，根据code解码出openid，使用openid查找用户信息并返回
+        url: 'https://xxx/silentLogin',
         data: {
-          code: wxLoginRes.code,
-          source: ZZLogin._config.source,
+          p: JSON.stringify({
+            code: wxLoginRes.code,
+            source: ZZLogin._config.source,
+            tokenVersion: 'basedOnOpenId',
+          })
         },
         method: "POST",
       });
+
+      mpLoginRes.respData && mpLoginRes.respData.token && cookie.set('tk', mpLoginRes.respData.token); //无论登录成功失败，都更新token
 
       if (!(mpLoginRes.respCode == 0 && mpLoginRes.respData.status == 0))
         return {succeeded: false};
 
       return {
         succeeded: true,
-        userInfo: mpLoginRes.respData.userInfo,  //昵称、头像等
-        zzUserInfo: mpLoginRes.respData.zzUserInfo, //uid、ppu
+        userInfo: mpLoginRes.respData,  //昵称、头像等
+        zzUserInfo: mpLoginRes.respData, //uid、ppu
       }
     },
     /**
      * 获取微信用户信息：调用微信相关API，请求用户授权访问个人信息
      * @return {Promise<Object>} 微信用户信息
      */
-    @mergingStep
     async requestUserInfo(){
       //获取用户信息；支持项目自定义交互过程，默认直接出授权弹窗
       let userInfoRes = (ZZLogin._config.userAuthHandler && await ZZLogin._config.userAuthHandler.call(this)) || (await wxResolve.getUserInfo({
@@ -223,7 +229,7 @@ class ZZLogin {
         ZZLogin._config.onUserAuthFailed && ZZLogin._config.onUserAuthFailed.call(this, {type: 'unknown', userInfoRes});
         return {succeeded: false, errMsg: 'wx.getUserInfo failed:' + JSON.stringify(userInfoRes)};
       }
-      
+
       ZZLogin._config.onUserAuthSucceeded && ZZLogin._config.onUserAuthSucceeded.call(this);
       userInfoRes.succeeded = true;
       return userInfoRes;
@@ -232,7 +238,6 @@ class ZZLogin {
      * 转转登录：根据微信用户标识&信息，注册/登录转转账户
      * @return {Promise<Object>} 转转账户信息
      */
-    @mergingStep
     async zzLogin({wxLoginRes, userInfoRes}){
       let zzLoginRes = await ZZLogin.request({
         url: 'https://xxx/login',
@@ -242,12 +247,13 @@ class ZZLogin {
           iv: userInfoRes.iv,
           source: ZZLogin._config.source,
           channelId: ZZLogin._config.entryInfo.channel,
+          tokenVersion: 'basedOnOpenId',
         },
         method: "POST",
       });
       if (zzLoginRes.respCode != 0) //转转登录失败，返回
         return {succeeded: false, errMsg:'zz login api failed:'+JSON.stringify(zzLoginRes), toastMsg: zzLoginRes.respData&&zzLoginRes.respData.errMsg};
-      
+
       return {
         succeeded: true,
         zzUserInfo: zzLoginRes.respData
@@ -276,8 +282,8 @@ class ZZLogin {
       cookie.set('uid', ZZLogin._zzUserInfo.uid);
       cookie.set('PPU', '"' + ZZLogin._zzUserInfo.ppu + '"');
       ZZLogin._zzUserInfo.token && cookie.set('tk', ZZLogin._zzUserInfo.token);
-      
-      
+
+
     },
 
     /**
@@ -287,14 +293,14 @@ class ZZLogin {
     async addOn(){
       if (!ZZLogin._config.loginStepAddOn)
         return {succeeded: true};
-      
+
       let stepRes = await ZZLogin._config.loginStepAddOn();
-      
+
       if (typeof stepRes !== "object"){
         console.error('[login] loginStepAddOn shall return an object, something like "{succeeded: true, errMsg:\'debug detail\', toastMsg: \'alert detail\'}", yet got return value:', stepRes);
         stepRes = {succeeded: false};
       }
-      
+
       return stepRes;
     },
 
@@ -307,14 +313,66 @@ class ZZLogin {
     async afterFetchInfoPack({userInfo, zzUserInfo}){
       ZZLogin._loginSteps.saveInfo({userInfo,zzUserInfo});
       let addOnRes = await ZZLogin._loginSteps.addOn();
-      
+
       if (!addOnRes.succeeded) {
         ZZLogin._clearLoginInfo();
         return {code: -4, errMsg: addOnRes.errMsg||'add on failed', toastMsg: addOnRes.toastMsg};
       }
-      
+
       return {code: 0, errMsg: 'ok'};
-    }
+    },
+
+    /**
+     * 静默登录步骤集合
+     * @return {Promise<*>}
+     */
+      @mergingStep //步骤并合修饰器，避免公共步骤并发重复进行
+    async silentLoginPack(){
+      let steps = ZZLogin._loginSteps;
+
+      //微信登录
+      let wxLoginRes = await steps.wxLogin();
+      if (!wxLoginRes.succeeded)
+        return { code: -1, errMsg: wxLoginRes.errMsg};
+
+      //尝试静默登录
+      let silentRes = await steps.silentLogin({wxLoginRes});
+      if (silentRes.succeeded) { //静默登录成功，保存登录信息，结束
+        return steps.afterFetchInfoPack({
+          userInfo: silentRes.userInfo,
+          zzUserInfo: silentRes.zzUserInfo,
+        });
+      } else { //静默登录失败
+        return {code: -304, errMsg: 'fail'};
+      }
+    },
+
+    /**
+     * 授权登录步骤集合
+     * @return {Promise<*>}
+     */
+      @mergingStep //步骤并合修饰器，避免公共步骤并发重复进行
+    async authLoginPack(){
+      let steps = ZZLogin._loginSteps;
+
+      let wxLoginRes = await steps.wxLogin(); //重新获取code，此前的code已被静默授权使用，不能复用
+
+      //请求授权微信用户信息
+      let userInfoRes = await steps.requestUserInfo.call(this);
+      if (!userInfoRes.succeeded)
+        return {code: -2, errMsg: userInfoRes.errMsg};
+
+      // 登录/注册转转账户
+      let zzLoginRes = await steps.zzLogin({wxLoginRes, userInfoRes});
+      if (!zzLoginRes.succeeded)
+        return {code: -3, errMsg: zzLoginRes.errMsg, toastMsg: zzLoginRes.toastMsg};
+
+      //保存登录信息
+      return steps.afterFetchInfoPack({
+        userInfo: userInfoRes.userInfo,
+        zzUserInfo: zzLoginRes.zzUserInfo,
+      });
+    },
   }
   /**
    * 登录
@@ -324,47 +382,20 @@ class ZZLogin {
    */
   static async _login(options){
     //若已登录且不是强制模式，直接返回
-    if (options.mode!=='force' && (await ZZLogin.checkLogin()))
+    if (options.mode!=='force' && options.mode!=='silentForce' && (await ZZLogin.checkLogin()))
       return {code:0, errMsg:'ok'};
 
-    let steps = ZZLogin._loginSteps;
-
-    //微信登录
-    let wxLoginRes = await steps.wxLogin();
-    if (!wxLoginRes.succeeded)
-      return { code: -1, errMsg: wxLoginRes.errMsg};
-
     //尝试静默登录
-    let silentRes = await steps.silentLogin({wxLoginRes});
-    if (silentRes.succeeded) { //静默登录成功，保存登录信息，结束；否则继续尝试授权登录
-      return steps.afterFetchInfoPack({
-        userInfo: silentRes.userInfo,
-        zzUserInfo: silentRes.zzUserInfo,
-      });
-    }
-    
-    if (options.mode==='silent') //静默模式，只尝试静默登录，不触发授权弹窗；不管成功失败都不影响页面功能和后续接口调用
+    let silentRes = await ZZLogin._loginSteps.silentLoginPack.call(this);
+    if (silentRes.errMsg === 'ok') //静默登录成功，结束
+      return silentRes;
+
+    //静默模式，只尝试静默登录，不触发授权弹窗；不管成功失败都不影响页面功能和后续接口调用
+    if (options.mode==='silent' || options.mode==='silentForce')
       return {code: 0, errMsg: 'login failed silently'};
-    
+
     //尝试授权登录
-    
-    wxLoginRes = await steps.wxLogin(); //重新获取code，此前的code已被静默授权使用，不能复用
-    
-    //请求授权微信用户信息
-    let userInfoRes = await steps.requestUserInfo.call(this);
-    if (!userInfoRes.succeeded)
-      return {code: -2, errMsg: userInfoRes.errMsg};
-    
-    // 登录/注册转转账户
-    let zzLoginRes = await steps.zzLogin({wxLoginRes, userInfoRes});
-    if (!zzLoginRes.succeeded)
-      return {code: -3, errMsg: zzLoginRes.errMsg, toastMsg: zzLoginRes.toastMsg};
-    
-    //保存登录信息
-    return steps.afterFetchInfoPack({
-      userInfo: userInfoRes.userInfo,
-      zzUserInfo: zzLoginRes.zzUserInfo,
-    });
+    return ZZLogin._loginSteps.authLoginPack.call(this);
   }
 
   /**
@@ -450,7 +481,8 @@ class ZZLogin {
    *    common - 通用模式，适合大部分页面场景
    *    silent - 静默模式，适合免打扰场景：只尝试静默登录，不触发授权弹窗；不管成功失败都不影响页面功能和后续接口调用
    *    force - 强制模式，适合解码场景：刷新微信session，保证解码加密数据时session不过期
-   *    
+   *    silentForce - 静默刷新模式，适合静默解码场景：对老用户，刷新微信session，保证解码加密数据时session不过期；对新用户，不触发授权
+   *
    * @return {Promise<Object>} res 登录结果，格式形如：{
      *    code: -3,   //状态码，0为成功
      *    errMsg:'zz login api failed...',  //详细错误日志，debug用
@@ -461,13 +493,13 @@ class ZZLogin {
     //参数处理
     if (typeof options === "function") //兼容旧版入参格式
       options = {callback: options};
-    
+
     let defaultOpts = {
       callback: null,
       mode: 'common',
     };
     options = Object.assign(defaultOpts, options);
-    
+
     //登录
     let loginRes = await ZZLogin._loginWithErrLog.call(this, options);
 
@@ -506,40 +538,42 @@ class ZZLogin {
       options = ZZLogin._config.beforeRequest.call(this, options) || options;
 
     return new Promise(async (resolve,reject)=>{
-      await ZZLogin._ensuringExistingToken();
+      await ZZLogin._ensuringExistingToken({url: options.url});
       ZZLogin._execRequest.call(this, options, requestDetail, resolve, reject);
     })
   }
 
   /**
-   * token机制，请求发起前，先确保本地有token，如果没有，调用接口生成一个临时token；登录后后端会将token与uid关联，使得用户登录前的行为也可以被追溯
+   * token机制，请求发起前，先给用户分配一个唯一标识，登录后再将该标识与uid关联
+   * 这样，可以提前对未登录用户进行标识和区分，从而实现：降低统计时uv偏差（避免未授权用户不被计入uv）、提升搜索推荐粒度（对未授权用户个性化推荐）等功能
+   * @param {string} url 请求的url，用于判断是否可以跳过token检查的白名单接口
    * @return {Promise}
    */
-  @mergingStep
-  static _ensuringExistingToken(){
-    return new Promise((resolve, reject)=>{
-      // token已存在
-      if(cookie.get('tk')){
-        resolve();
-        return;
-      }
+  @errSafe
+  static async _ensuringExistingToken({url=''}={}){
+    // 若已存在符合要求的token，则无需再次处理（不符合要求的token为旧版规则遗留，需予以覆盖）
+    let tk = cookie.get('tk') || '';
+    if (/^wt-/.test(tk))
+      return;
 
-      ZZLogin._config.requester({
-        url: 'https://xxx/getTempToken',
-        success(res){
-          let respCode = res.data.respCode;
-          if(respCode == 0){
-            if(!cookie.get('tk')){
-              cookie.set('tk', res.data.respData.result);
-            }
-          }
-        },
-        complete(){
-          // 成功失败都resolve，保证await后续请求流程可以正常进行
-          resolve();
-        }
-      })
-    });
+    //负责维护token的接口，调用前不需要进行token检查
+    let whitelist = [
+      'https://xxx/silentLogin',
+      'https://xxx/login',
+    ];
+
+    if (whitelist.includes(url.split('?')[0]))
+      return;
+
+    //获取/生成token
+    await ZZLogin._acquireToken();
+  }
+
+  @mergingStep
+  static async _acquireToken(){
+    //静默登录，根据openId生成并设置token
+    ZZLogin._clearLoginInfo();
+    await ZZLogin.login({mode: 'silent'});
   }
 
   static _execRequest(options, requestDetail, resolve, reject){
@@ -567,7 +601,7 @@ class ZZLogin {
     let oriSuccessHandler = opts.success;
     let oriFailHandler = opts.fail;
     let oriCompleteHandler = opts.complete;
-    
+
     let diySuccess = (res)=>{
       // 写cookie
       if(res.header && res.header['set-cookie']) {
